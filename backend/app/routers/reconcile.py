@@ -29,6 +29,10 @@ class FateIn(BaseModel):
     fate: str
 
 
+class VerifyIn(BaseModel):
+    period_id: str
+
+
 @router.post("/align")
 def align(body: AlignIn):
     return reconcile_service.run_align(body.period_id, body.building)
@@ -134,6 +138,13 @@ def set_fate(variance_id: str, body: FateIn):
 @router.post("/seal")
 def seal(body: SealIn):
     return reconcile_service.seal_period(body.period_id, body.batch_id, body.building)
+
+
+@router.post("/seal/verify")
+def seal_verify(body: VerifyIn):
+    """封印度量核对：以正式键集合重放该账期全部 sealed 批，分叉即重算回写，
+    正式空而批头非零则作废现行并回滚明细。"""
+    return reconcile_service.verify_period(body.period_id)
 
 
 @router.get("/periods")

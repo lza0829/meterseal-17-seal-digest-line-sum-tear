@@ -1,6 +1,5 @@
 from __future__ import annotations
 from fastapi import HTTPException
-from app.services import seal_metrics
 
 from app.db import connect
 
@@ -57,27 +56,51 @@ def is_building_sealed(conn, period_id: str, building: str) -> bool:
 
 
 def assert_meter_writable(conn, period_id: str, meter_id: str) -> None:
-    """写闸唯一入口：根据当前架构口径判断该表具是否可写。"""
+    """写闸唯一入口：按当前架构口径判定。已封一律 409 —— 封后补抄只走专用旁路端点，
+    旁路在同事务内重算封印度量，不存在“放行但不刷新”的暗道。"""
     if is_period_sealed(conn, period_id):
-        if seal_metrics.estimate_gate_relaxed(conn, period_id):
-            return
         raise HTTPException(409, f"账期已封印，禁止写入: {period_id}")
     if get_seal_mode() == SEAL_MODE_BUILDING:
         building = resolve_building(conn, meter_id)
         if is_building_sealed(conn, period_id, building):
-            if seal_metrics.estimate_gate_relaxed(conn, period_id):
-                return
             raise HTTPException(409, f"楼栋 {building} 在账期 {period_id} 已分区封印，禁止写入")
 
 
-def assert_period_writable(period_id: str) -> None:
-    """无表具上下文的整期操作（对齐等）用：整期封必拒；分区模式由调用方再按楼栋细化。"""
-    conn = connect()
-    try:
-        if is_period_sealed(conn, period_id):
-            raise HTTPException(409, f"账期已封印，禁止写入: {period_id}")
-    finally:
-        conn.close()
+def sealed_batch_for_meter(conn, period_id: str, meter_id: str):
+    """封后补抄旁路定位：返回覆盖该表具的 sealed 批（整期封优先，其次本栋分区封）。
+
+    口径与 assert_meter_writable 完全镜像：写闸认定“已封”的范围，旁路才认；
+    未封返回 None（调用方应指引走正常装载）。
+    """
+    period = conn.execute(
+        "SELECT * FROM periods WHERE period_id=?", (period_id,)
+    ).fetchone()
+    if not period:
+        raise HTTPException(404, f"账期不存在: {period_id}")
+    if period["status"] == "sealed":
+        bid = period["batch_no"]
+        batch = (
+            conn.execute(
+                "SELECT * FROM reconcile_batches WHERE batch_id=?", (bid,)
+            ).fetchone()
+            if bid
+            else None
+        )
+        # 不变式：账期 sealed ⟹ batch_no 指向 sealed 批（作废会同事务解开账期）
+        return batch if batch and batch["status"] == "sealed" else None
+    if get_seal_mode() == SEAL_MODE_BUILDING:
+        building = resolve_building(conn, meter_id)
+        row = conn.execute(
+            "SELECT batch_id FROM sealed_buildings WHERE period_id=? AND building=?",
+            (period_id, building),
+        ).fetchone()
+        if not row:
+            return None
+        batch = conn.execute(
+            "SELECT * FROM reconcile_batches WHERE batch_id=?", (row["batch_id"],)
+        ).fetchone()
+        return batch if batch and batch["status"] == "sealed" else None
+    return None
 
 
 def assert_building_writable(conn, period_id: str, building: str) -> None:

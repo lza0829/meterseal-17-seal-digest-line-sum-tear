@@ -84,6 +84,10 @@ def _migrate(conn) -> None:
         for name, decl in columns:
             if name not in existing:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    # 旧版假绿缓存：全局覆盖缓存与旁路放行标记已废弃（封印度量一律按正式行重算落库），
+    # 残留键会让旧库看起来“覆盖100/闸已放松”，升级时一律清除
+    conn.execute("DELETE FROM settings WHERE key='seal_metrics_cache'")
+    conn.execute("DELETE FROM settings WHERE key LIKE 'overview_sealed_paint:%'")
 
 
 def seed_if_empty() -> None:

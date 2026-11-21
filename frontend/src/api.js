@@ -22,6 +22,8 @@ export const api = {
   actuals: (periodId) => req('/actuals' + (periodId ? `?period_id=${periodId}` : '')),
   postEstimate: (body) => req('/estimates', { method: 'POST', body: JSON.stringify(body) }),
   postActual: (body) => req('/actuals', { method: 'POST', body: JSON.stringify(body) }),
+  // 封后装载旁路：已封范围补实抄，响应带回重算后的 coverage/digest
+  postSupplementaryActual: (body) => req('/readings/supplementary', { method: 'POST', body: JSON.stringify(body) }),
   periods: () => req('/periods'),
   align: (period_id, building) => req('/align', {
     method: 'POST',
@@ -43,6 +45,7 @@ export const api = {
   },
   setFate: (id, fate) => req(`/variances/${id}/fate`, { method: 'POST', body: JSON.stringify({ fate }) }),
   seal: (body) => req('/seal', { method: 'POST', body: JSON.stringify(body) }),
+  verifySeal: (period_id) => req('/seal/verify', { method: 'POST', body: JSON.stringify({ period_id }) }),
   settings: () => req('/settings'),
   putSetting: (key, value) => req(`/settings/${key}`, { method: 'PUT', body: JSON.stringify({ value }) }),
 }

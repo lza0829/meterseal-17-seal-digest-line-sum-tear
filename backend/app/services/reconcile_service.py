@@ -1,5 +1,4 @@
 from __future__ import annotations
-import hashlib
 import uuid
 from datetime import datetime, timezone
 from app.services import seal_metrics
@@ -12,35 +11,12 @@ from app.services.gate import (
     SEAL_MODE_BUILDING,
     SEAL_MODE_PERIOD,
     assert_building_writable,
-    assert_period_writable,
     get_seal_mode,
 )
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
-
-
-def _meter_ids(conn, period_id: str, building: str | None) -> list[str]:
-    if building is None:
-        rows = conn.execute(
-            """SELECT DISTINCT m.meter_id FROM meters m
-               WHERE m.meter_id IN (
-                 SELECT meter_id FROM estimates WHERE period_id=?
-                 UNION SELECT meter_id FROM actuals WHERE period_id=?
-               ) ORDER BY m.meter_id""",
-            (period_id, period_id),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT DISTINCT m.meter_id FROM meters m
-               WHERE m.building=? AND m.meter_id IN (
-                 SELECT meter_id FROM estimates WHERE period_id=?
-                 UNION SELECT meter_id FROM actuals WHERE period_id=?
-               ) ORDER BY m.meter_id""",
-            (building, period_id, period_id),
-        ).fetchall()
-    return [r["meter_id"] for r in rows]
 
 
 def run_align(period_id: str, building: str | None = None) -> dict:
@@ -50,14 +26,17 @@ def run_align(period_id: str, building: str | None = None) -> dict:
         raise HTTPException(400, "分区封印架构下对齐必须指定楼栋 building")
     conn = connect()
     try:
+        # 立即事务：过期旧批 + 建新批 + 明细一把落库，并发装载/封印不会看见半截批
+        conn.execute("BEGIN IMMEDIATE")
         if building is not None:
             gate.assert_building_known(conn, building)
             assert_building_writable(conn, period_id, building)
-        else:
-            assert_period_writable(period_id)
+        elif gate.is_period_sealed(conn, period_id):
+            raise HTTPException(409, f"账期已封印，禁止写入: {period_id}")
 
-        meter_ids = _meter_ids(conn, period_id, building)
-        if not meter_ids:
+        # 正式键真源：批头计数与 digest 都从正式估抄∪实抄对齐行重算
+        m = seal_metrics.compute_metrics(conn, period_id, building)
+        if m["formal_keys"] == 0:
             raise HTTPException(400, "该范围内无估抄/实抄可对齐")
 
         # 只过期“同作用域”的开放批：分区批按楼栋隔离，整期批按空楼栋隔离
@@ -74,72 +53,39 @@ def run_align(period_id: str, building: str | None = None) -> dict:
                 (period_id, building),
             )
 
-        placeholders = ",".join("?" for _ in meter_ids)
-        est = {
-            r["meter_id"]: r
-            for r in conn.execute(
-                f"SELECT * FROM estimates WHERE period_id=? AND meter_id IN ({placeholders})",
-                (period_id, *meter_ids),
-            ).fetchall()
-        }
-        act = {
-            r["meter_id"]: r
-            for r in conn.execute(
-                f"SELECT * FROM actuals WHERE period_id=? AND meter_id IN ({placeholders})",
-                (period_id, *meter_ids),
-            ).fetchall()
-        }
-        keys = sorted(set(est) | set(act))
-
         batch_id = "B-" + uuid.uuid4().hex[:10]
-        matched = 0
-        variances = []
-        for mid in keys:
-            eq = est[mid]["qty"] if mid in est else None
-            aq = act[mid]["qty"] if mid in act else None
-            if eq is not None and aq is not None and abs(eq - aq) < 1e-9:
-                matched += 1
-                continue
-            delta = (aq if aq is not None else 0.0) - (eq if eq is not None else 0.0)
-            variances.append(
-                (
-                    "V-" + uuid.uuid4().hex[:10],
-                    batch_id,
-                    mid,
-                    period_id,
-                    eq,
-                    aq,
-                    delta,
-                    "pending",
-                )
-            )
-
         scope = SEAL_MODE_BUILDING if building is not None else SEAL_MODE_PERIOD
-        fp_src = f"{period_id}|{scope}|{building or ''}|{matched}|{len(variances)}|" + ",".join(keys)
-        fingerprint = hashlib.sha256(fp_src.encode()).hexdigest()[:16]
         conn.execute(
             """INSERT INTO reconcile_batches
                (batch_id,period_id,status,matched_count,variance_count,fingerprint,created_at,sealed_scope,building)
                VALUES (?,?, 'open',?,?,?,?,?,?)""",
-            (batch_id, period_id, matched, len(variances), fingerprint, _now(), scope, building),
+            (
+                batch_id,
+                period_id,
+                m["matched_count"],
+                m["variance_count"],
+                m["digest"],
+                _now(),
+                scope,
+                building,
+            ),
         )
-        if variances:
-            conn.executemany(
-                """INSERT INTO variances(variance_id,batch_id,meter_id,period_id,estimate_qty,actual_qty,delta,fate)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                variances,
-            )
+        # 对齐明细与批头同源：同一份正式行派生，不存在两套行集合
+        seal_metrics.rebuild_batch_detail(conn, batch_id, period_id, m["rows"])
         conn.commit()
         return {
             "batch_id": batch_id,
             "period_id": period_id,
             "building": building,
             "sealed_scope": scope,
-            "matched_count": matched,
-            "variance_count": len(variances),
-            "fingerprint": fingerprint,
+            "matched_count": m["matched_count"],
+            "variance_count": m["variance_count"],
+            "fingerprint": m["digest"],
             "status": "open",
         }
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -177,6 +123,38 @@ def _validate_batch(conn, period_id: str, batch_id: str | None, building: str | 
     return conn.execute("SELECT * FROM reconcile_batches WHERE batch_id=?", (batch_id,)).fetchone()
 
 
+def _seal_scope(conn, period_id: str, building: str | None, batch) -> dict:
+    """封印落库核心（调用方已持写事务）：按正式行重算并回写批头/明细/digest/投影。
+
+    正式键架构的封印语义：批头覆盖与 digest 以正式估抄∪实抄对齐键集合为准，
+    封印时刻重算落库 —— 回执数字即可被正式键重放，不是另一套。
+    """
+    bid = batch["batch_id"]
+    m = seal_metrics.compute_metrics(conn, period_id, building)
+    if m["formal_keys"] == 0:
+        # 禁止无正式行当封印凭证：空行集合不得落成 sealed 现行
+        raise HTTPException(409, "正式估抄/实抄行集合为空，禁止以空行集合充当封印凭证")
+    seal_metrics.rebuild_batch_detail(conn, bid, period_id, m["rows"])
+    conn.execute(
+        """UPDATE reconcile_batches
+           SET status='sealed', matched_count=?, variance_count=?, fingerprint=?
+           WHERE batch_id=?""",
+        (m["matched_count"], m["variance_count"], m["digest"], bid),
+    )
+    pending = conn.execute(
+        "SELECT COUNT(*) AS c FROM variances WHERE batch_id=? AND fate='pending'",
+        (bid,),
+    ).fetchone()["c"]
+    return {
+        "batch_id": bid,
+        "matched_count": m["matched_count"],
+        "variance_count": m["variance_count"],
+        "coverage": m["coverage"],
+        "digest": m["digest"],
+        "pending_left": pending,
+    }
+
+
 def seal_period(period_id: str, batch_id: str | None = None, building: str | None = None) -> dict:
     mode = get_seal_mode()
     # 入口口径分叉：分区架构必须带楼栋；整期架构禁止带楼栋宣称分区封
@@ -199,32 +177,25 @@ def seal_period(period_id: str, batch_id: str | None = None, building: str | Non
             if period["status"] == "sealed":
                 raise HTTPException(409, "账期已封印")
             batch = _validate_batch(conn, period_id, batch_id, None)
-            bid = batch["batch_id"]
-            pending = conn.execute(
-                "SELECT COUNT(*) AS c FROM variances WHERE batch_id=? AND fate='pending'",
-                (bid,),
-            ).fetchone()["c"]
             sealed_at = _now()
+            metrics = _seal_scope(conn, period_id, None, batch)
             # 一把封关闭该 period 全部表的写闸
             conn.execute(
                 "UPDATE periods SET status='sealed', sealed_at=?, batch_no=? WHERE period_id=?",
-                (sealed_at, bid, period_id),
+                (sealed_at, metrics["batch_id"], period_id),
             )
-            conn.execute(
-                "UPDATE reconcile_batches SET status='sealed' WHERE batch_id=?", (bid,)
-            )
-            metrics = seal_metrics.paint_after_seal(conn, period_id, bid, None)
+            seal_metrics.persist_period_projection(conn, period_id)
             conn.commit()
             return {
                 "period_id": period_id,
                 "building": None,
                 "sealed_scope": SEAL_MODE_PERIOD,
-                "batch_id": bid,
+                "batch_id": metrics["batch_id"],
                 "sealed_at": sealed_at,
-                "pending_left": pending,
+                "pending_left": metrics["pending_left"],
                 "status": "sealed",
-                "coverage": metrics.get("coverage"),
-                "digest": metrics.get("digest"),
+                "coverage": metrics["coverage"],
+                "digest": metrics["digest"],
             }
 
         # 分区架构
@@ -238,34 +209,108 @@ def seal_period(period_id: str, batch_id: str | None = None, building: str | Non
         if existing:
             raise HTTPException(409, f"楼栋 {building} 在账期 {period_id} 已分区封印")
         batch = _validate_batch(conn, period_id, batch_id, building)
-        bid = batch["batch_id"]
-        pending = conn.execute(
-            "SELECT COUNT(*) AS c FROM variances WHERE batch_id=? AND fate='pending'",
-            (bid,),
-        ).fetchone()["c"]
         sealed_at = _now()
+        metrics = _seal_scope(conn, period_id, building, batch)
         # 主键 (period_id, building) 兜底并发：同栋重复封直接冲突，不会产生第二条/半截记录
         conn.execute(
             """INSERT INTO sealed_buildings(period_id,building,batch_id,sealed_at)
                VALUES (?,?,?,?)""",
-            (period_id, building, bid, sealed_at),
+            (period_id, building, metrics["batch_id"], sealed_at),
         )
-        conn.execute(
-            "UPDATE reconcile_batches SET status='sealed' WHERE batch_id=?", (bid,)
-        )
-        metrics = seal_metrics.paint_after_seal(conn, period_id, bid, building)
+        seal_metrics.persist_period_projection(conn, period_id)
         conn.commit()
         return {
             "period_id": period_id,
             "building": building,
             "sealed_scope": SEAL_MODE_BUILDING,
-            "batch_id": bid,
+            "batch_id": metrics["batch_id"],
             "sealed_at": sealed_at,
-            "pending_left": pending,
+            "pending_left": metrics["pending_left"],
             "status": "sealed",
-            "coverage": metrics.get("coverage"),
-            "digest": metrics.get("digest"),
+            "coverage": metrics["coverage"],
+            "digest": metrics["digest"],
         }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def verify_period(period_id: str) -> dict:
+    """封印度量核对：以正式键集合重放该账期全部 sealed 批，收敛库内分叉。
+
+    - 批头计数 / digest / 对齐明细与正式行重放不符 → 同事务重算回写（repaired）；
+    - 正式空而批头非零 → 作废该 sealed 现行并回滚半截明细（voided）；
+    - 全部一致 → ok。回执数字对齐不算过关，库内四分叉消除才算。
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        period = conn.execute(
+            "SELECT * FROM periods WHERE period_id=?", (period_id,)
+        ).fetchone()
+        if not period:
+            raise HTTPException(404, "账期不存在")
+        sealed = conn.execute(
+            "SELECT * FROM reconcile_batches WHERE period_id=? AND status='sealed' ORDER BY batch_id",
+            (period_id,),
+        ).fetchall()
+        actions = []
+        for b in sealed:
+            building = b["building"] if b["sealed_scope"] == "building" else None
+            m = seal_metrics.compute_metrics(conn, period_id, building)
+            header_nonzero = int(b["matched_count"] or 0) + int(b["variance_count"] or 0) > 0
+            if m["formal_keys"] == 0 and header_nonzero:
+                seal_metrics.void_sealed_batch(conn, b)
+                actions.append(
+                    {
+                        "batch_id": b["batch_id"],
+                        "building": building,
+                        "action": "voided",
+                        "reason": "正式行集合为空而批头非零，作废 sealed 现行并回滚明细",
+                    }
+                )
+                continue
+            consistent = (
+                int(b["matched_count"] or 0) == m["matched_count"]
+                and int(b["variance_count"] or 0) == m["variance_count"]
+                and (b["fingerprint"] or "") == m["digest"]
+                and seal_metrics.detail_consistent(conn, b["batch_id"], m["rows"])
+            )
+            if consistent:
+                actions.append(
+                    {
+                        "batch_id": b["batch_id"],
+                        "building": building,
+                        "action": "ok",
+                        "digest": m["digest"],
+                    }
+                )
+                continue
+            before = b["fingerprint"]
+            seal_metrics.rebuild_batch_detail(conn, b["batch_id"], period_id, m["rows"])
+            conn.execute(
+                """UPDATE reconcile_batches
+                   SET matched_count=?, variance_count=?, fingerprint=?
+                   WHERE batch_id=?""",
+                (m["matched_count"], m["variance_count"], m["digest"], b["batch_id"]),
+            )
+            actions.append(
+                {
+                    "batch_id": b["batch_id"],
+                    "building": building,
+                    "action": "repaired",
+                    "digest_before": before,
+                    "digest": m["digest"],
+                    "matched_count": m["matched_count"],
+                    "variance_count": m["variance_count"],
+                    "coverage": m["coverage"],
+                }
+            )
+        projection = seal_metrics.persist_period_projection(conn, period_id)
+        conn.commit()
+        return {"period_id": period_id, "actions": actions, "projection": projection}
     except Exception:
         conn.rollback()
         raise

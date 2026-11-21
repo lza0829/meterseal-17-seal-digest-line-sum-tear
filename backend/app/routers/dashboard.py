@@ -58,6 +58,11 @@ def overview():
             "pending_variances": pending,
             "recent_batches": batches,
         }
-        return seal_metrics.overview_overlay(conn, base)
+        # 总览覆盖/digest 只读已落库的账期投影（封印/补抄/核对时同事务写入），
+        # 没有投影就是没有 —— 不虚构覆盖、不改写账期状态、不克扣未决差额
+        proj = seal_metrics.overview_projection(conn, current) if current else None
+        base["seal_coverage"] = proj.get("coverage") if proj else None
+        base["seal_digest"] = proj.get("digest") if proj else None
+        return base
     finally:
         conn.close()

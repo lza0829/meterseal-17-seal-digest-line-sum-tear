@@ -22,12 +22,22 @@ async function submit() {
     await load()
   } catch (e) { err.value = e.message }
 }
+async function supplementary() {
+  err.value = ''; msg.value = ''
+  try {
+    const body = { ...form.value, doc_no: form.value.doc_no || ('补-' + Date.now()) }
+    const r = await api.postSupplementaryActual(body)
+    // 旁路不脱钩：响应带回同事务重算的批头覆盖与 digest，与库内一致
+    msg.value = `封后补抄已装载并刷新封印度量：覆盖 ${r.coverage}，摘要 ${r.digest}`
+    await load()
+  } catch (e) { err.value = e.message }
+}
 onMounted(load)
 </script>
 <template>
   <div>
     <h1>实抄</h1>
-    <p class="sub">现场实抄读数入湖；整期封印或本栋分区封印后会拒写（具体原因见装载返回）</p>
+    <p class="sub">现场实抄读数入湖；整期封印或本栋分区封印后正常装载拒写，迟到实抄走「封后补抄」旁路（同事务刷新封印度量）</p>
     <div class="row">
       <label>账期筛选<input v-model="periodId" /></label>
       <button class="secondary" @click="load">刷新</button>
@@ -41,6 +51,7 @@ onMounted(load)
         <label>抄表员<input v-model="form.reader_code" /></label>
         <label>单号<input v-model="form.doc_no" placeholder="可空自动生成" /></label>
         <button @click="submit">装载实抄</button>
+        <button class="secondary" title="账期/楼栋已封后补录迟到实抄，同事务刷新批头覆盖与摘要" @click="supplementary">封后补抄</button>
       </div>
       <p class="msg ok" v-if="msg">{{ msg }}</p>
       <p class="msg err" v-if="err">{{ err }}</p>
